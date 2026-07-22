@@ -179,3 +179,5 @@ before bumping either.
 ## Open TODOs
 
 - Manage event types from the UI (add/edit/delete) — currently only given
+- Change Widgets sizes
+- Does not show sync worked yet
