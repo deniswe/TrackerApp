@@ -5,6 +5,7 @@ import android.util.Log
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.example.trackerapp.TrackerApplication
+import com.example.trackerapp.data.network.BulkDeleteResult
 import com.example.trackerapp.data.network.BulkUploadResult
 import com.example.trackerapp.data.network.EventDto
 import kotlinx.coroutines.flow.first
@@ -20,7 +21,8 @@ class SyncWorker(
         val entryDao = app.database.eventEntryDao()
 
         val unsynced = entryDao.getUnsynced()
-        if (unsynced.isEmpty()) {
+        val pendingDeletes = entryDao.getDeletePending()
+        if (unsynced.isEmpty() && pendingDeletes.isEmpty()) {
             return Result.success()
         }
 
@@ -30,41 +32,70 @@ class SyncWorker(
             return Result.success()
         }
 
-        val dtos = unsynced.map { entry ->
-            EventDto(
-                clientEventId = entry.clientEventId,
-                type = entry.typeKey,
-                timestamp = Instant.ofEpochMilli(entry.epochMillis).toString(),
-                source = entry.source,
-                value = entry.value,
-                note = entry.note
-            )
+        var needsRetry = false
+        var permanentFailure = false
+
+        if (unsynced.isNotEmpty()) {
+            val dtos = unsynced.map { entry ->
+                EventDto(
+                    clientEventId = entry.clientEventId,
+                    type = entry.typeKey,
+                    timestamp = Instant.ofEpochMilli(entry.epochMillis).toString(),
+                    source = entry.source,
+                    value = entry.value,
+                    note = entry.note
+                )
+            }
+
+            when (app.apiClient.postEventsBulk(baseUrl, dtos)) {
+                BulkUploadResult.Success -> {
+                    entryDao.markSynced(unsynced.map { it.clientEventId })
+                    app.settingsRepository.recordSyncSuccess(System.currentTimeMillis())
+                    Log.i(TAG, "Synced ${unsynced.size} event(s) to $baseUrl")
+                }
+
+                BulkUploadResult.Rejected -> {
+                    // 422: backend rejected the batch outright (e.g. a malformed
+                    // timestamp) — a permanent problem, not a transient one, so retrying
+                    // with backoff would just loop forever without ever succeeding.
+                    Log.e(TAG, "Backend rejected the batch (422) — not retrying")
+                    permanentFailure = true
+                }
+
+                BulkUploadResult.Failure -> {
+                    Log.w(TAG, "Sync failed (backend unreachable or errored) — will retry")
+                    needsRetry = true
+                }
+            }
         }
 
-        return when (app.apiClient.postEventsBulk(baseUrl, dtos)) {
-            BulkUploadResult.Success -> {
-                entryDao.markSynced(unsynced.map { it.clientEventId })
-                app.settingsRepository.recordSyncSuccess(System.currentTimeMillis())
-                Log.i(TAG, "Synced ${unsynced.size} event(s) to $baseUrl")
-                Result.success()
-            }
+        // Batched per the backend's bulk-delete limit (1..500 keys per request).
+        for (chunk in pendingDeletes.chunked(MAX_BULK_DELETE_BATCH)) {
+            val clientEventIds = chunk.map { it.clientEventId }
+            when (app.apiClient.postEventsBulkDelete(baseUrl, clientEventIds)) {
+                BulkDeleteResult.Success -> {
+                    // 200 means every key in this chunk is now gone server-side
+                    // (deleted just now, or already gone) — safe to purge locally.
+                    entryDao.purge(clientEventIds)
+                    Log.i(TAG, "Purged ${clientEventIds.size} deleted event(s) from $baseUrl")
+                }
 
-            BulkUploadResult.Rejected -> {
-                // 422: backend rejected the batch outright (e.g. a malformed
-                // timestamp) — a permanent problem, not a transient one, so retrying
-                // with backoff would just loop forever without ever succeeding.
-                Log.e(TAG, "Backend rejected the batch (422) — not retrying")
-                Result.failure()
+                BulkDeleteResult.Failure -> {
+                    Log.w(TAG, "Delete sync failed (backend unreachable, errored, or unauthorized) — will retry")
+                    needsRetry = true
+                }
             }
+        }
 
-            BulkUploadResult.Failure -> {
-                Log.w(TAG, "Sync failed (backend unreachable or errored) — will retry")
-                Result.retry()
-            }
+        return when {
+            needsRetry -> Result.retry()
+            permanentFailure -> Result.failure()
+            else -> Result.success()
         }
     }
 
     companion object {
         const val TAG = "SyncWorker"
+        private const val MAX_BULK_DELETE_BATCH = 500
     }
 }

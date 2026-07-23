@@ -20,6 +20,12 @@ allow better insights.
   `java.time.Instant` is available natively, no desugaring needed)
 - JDK 21 (managed automatically via the Gradle toolchain — see
   `gradle/gradle-daemon-jvm.properties`)
+- A `HEALTH_API_TOKEN` entry in `local.properties` (gitignored, not checked in),
+  matching whatever token the backend expects via
+  `Authorization: Bearer <token>`. Without it, `ApiClient` still runs but every
+  sync attempt gets `401` and logs a warning — events stay queued locally rather
+  than failing loudly. See `data/network/ApiClient.kt` and the `buildConfigField`
+  wiring in `app/build.gradle.kts`.
 
 ## Building and running
 
@@ -114,18 +120,22 @@ even at that size.
 ### Sync (WorkManager)
 
 `SyncWorker` is triggered three ways, matching `APP_PROJECT.md`'s sync-behavior
-section: on every tap/add (`EventRepository` calls `SyncScheduler.scheduleOneTime`
-after every insert/delete), on app open (`MainActivity.onCreate`), and manually (the
-refresh icon on the Overview screen). It reads unsynced, non-deleted rows, POSTs them
-to `<baseUrl>/events/bulk`, and on success marks them synced and records the sync
-time. A `422` response (malformed payload — shouldn't happen given rule #2 in
-`APP_PROJECT.md`, but backends can always surprise you) is treated as permanent and
-does **not** retry; any other failure (backend unreachable, 5xx, timeout) does, via
-WorkManager's exponential backoff.
+section: on every tap/add/delete (`EventRepository` calls
+`SyncScheduler.scheduleOneTime` after every insert/delete), on app open
+(`MainActivity.onCreate`), and manually (the refresh icon on the Overview screen). On
+each run it handles two independent queues:
 
-Soft-deleted entries (see below) are deliberately excluded from what gets uploaded —
-propagating *deletes* to the backend isn't implemented yet (no endpoint for it), so
-they just sit locally, hidden from the UI, until that lands.
+- **Creates**: unsynced, non-deleted rows are POSTed to `<baseUrl>/events/bulk`; on
+  success they're marked synced and the sync time is recorded. A `422` response
+  (malformed payload — shouldn't happen given rule #2 in `APP_PROJECT.md`, but
+  backends can always surprise you) is treated as permanent and does **not** retry.
+- **Deletes**: already-synced entries that got deleted locally (soft-deleted, see
+  below) are POSTed in batches to `<baseUrl>/events/bulk-delete`; on any `200` the
+  rows are purged locally (the endpoint is idempotent — unknown keys just come back
+  as `not_found`, not an error).
+
+Any other failure on either queue (backend unreachable, `401`, 5xx, timeout) retries
+via WorkManager's exponential backoff, and never marks/purges rows on that queue.
 
 ### Delete semantics
 

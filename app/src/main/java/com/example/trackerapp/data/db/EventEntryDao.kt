@@ -26,9 +26,9 @@ interface EventEntryDao {
     )
     suspend fun softDelete(clientEventId: String, deletedAt: Long)
 
-    // deleted = 0: deletions aren't propagated to the backend yet (no delete endpoint
-    // there), so soft-deleted rows stay out of the create-sync upload queue even
-    // though they're technically "unsynced" — see APP_PROJECT.md's delete semantics.
+    // deleted = 0: soft-deleted rows are propagated to the backend via the separate
+    // delete-pending queue below instead of this create-sync queue, even though
+    // they're technically "unsynced" — see APP_PROJECT.md's delete semantics.
     @Query("SELECT * FROM event_entries WHERE synced = 0 AND deleted = 0 ORDER BY epochMillis")
     suspend fun getUnsynced(): List<EventEntryEntity>
 
@@ -37,4 +37,12 @@ interface EventEntryDao {
 
     @Query("UPDATE event_entries SET synced = 1 WHERE clientEventId IN (:clientEventIds)")
     suspend fun markSynced(clientEventIds: List<String>)
+
+    // deleted = 1 AND synced = 0: already-synced rows soft-deleted locally, whose
+    // deletion hasn't yet been confirmed against the backend via bulk-delete.
+    @Query("SELECT * FROM event_entries WHERE deleted = 1 AND synced = 0 ORDER BY epochMillis")
+    suspend fun getDeletePending(): List<EventEntryEntity>
+
+    @Query("DELETE FROM event_entries WHERE clientEventId IN (:clientEventIds)")
+    suspend fun purge(clientEventIds: List<String>)
 }

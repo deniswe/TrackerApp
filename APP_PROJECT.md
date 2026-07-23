@@ -99,9 +99,12 @@ calls the same repository method with an explicit timestamp/value instead of
   safe overlapping batches.
 - Server **rejects any timestamp without an explicit offset with 422**.
 - On 2xx, the app marks those rows `synced = true`.
-
-> NOTE: the existing backend may need a `/events/bulk` endpoint and a
-> `client_event_id` unique column added to match this contract.
+- Every endpoint except `GET /health` requires `Authorization: Bearer <token>`; a
+  401 is treated the same as a network failure (row stays queued, retried later).
+- Endpoint: `POST /events/bulk-delete`, accepting `{ client_event_ids: [UUID, ...] }`
+  (1..500 keys), returning `{ deleted: n, not_found: m }`. Idempotent — unknown keys
+  count as `not_found`, not an error — so any 200 means every requested key is now
+  gone server-side, and the app purges those rows locally on any 200.
 
 ## Local data model (Room)
 
@@ -118,11 +121,12 @@ calls the same repository method with an explicit timestamp/value instead of
     deletion. Not-yet-synced rows are hard-deleted outright — nothing reached the
     backend, nothing to reconcile. Already-synced rows are soft-deleted: `deleted =
     true` (hidden from the UI's recent-entries query) and `synced` is flipped back to
-    `false`, so the row re-enters the same "unsynced" queue the sync worker already
-    watches. A future delete-propagation feature reuses that existing queue rather
-    than needing a second sync-tracking column: for `deleted = true` rows it calls a
-    (future) delete endpoint instead of `/events/bulk`, then sets `synced = true`
-    again meaning "backend now reflects this row's deleted state."
+    `false`, so the row becomes "delete-pending" — a queue the sync worker watches
+    separately from the create-sync queue (`deleted = 0 AND synced = 0`). Delete-
+    pending rows (`deleted = 1 AND synced = 0`) are sent to the backend via
+    `POST /events/bulk-delete` (batched, 1..500 `client_event_id`s per request); a
+    200 response is idempotent (unknown keys count as `not_found`, not an error), so
+    the worker purges (hard-deletes) every row in the request locally on any 200.
 - **Widget instance state** is not a Room table — each placed widget snapshots its
   own `backendKey`, kind, scale/fixed-value choice, and label/emoji/color into
   Glance's per-widget state at placement time. This mirrors the `typeKey`
@@ -163,7 +167,4 @@ calls the same repository method with an explicit timestamp/value instead of
 
 - Reading Health Connect / wearable metrics from this app.
 - Editing already-synced entries.
-- **Propagating deletes to the backend** — deleting an already-synced entry hides it
-  locally (soft-delete, see Local data model) but the backend still has it until a
-  delete endpoint exists there and the sync worker is taught to call it.
 - iOS.
